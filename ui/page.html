@@ -82,12 +82,9 @@
   a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; }
   code { background: var(--panel2); padding: 1px 5px; border-radius: 3px; font-size: 11px; }
-  .exportify-frame {
-    border: 1px solid var(--border); border-radius: 8px;
-    overflow: hidden; background: #fff;
-    height: 520px;
-  }
-  .exportify-frame iframe { width: 100%; height: 100%; border: 0; display: block; }
+  .steps { margin: 4px 0 10px; padding-left: 22px; line-height: 1.7; }
+  .steps li { margin-bottom: 2px; }
+  .muted { color: var(--muted); }
   .dropzone {
     margin-top: 10px;
     border: 2px dashed var(--border); border-radius: 8px;
@@ -126,15 +123,19 @@
 
   <!-- CSV mode -->
   <div id="modeCsv" class="mode" style="display: none;">
-    <div class="small" style="margin-bottom: 8px;">
-      1. Sign in to Spotify below (one time). 2. Click <b>Export</b> next to a
-      playlist — your browser saves a CSV. 3. Drop that CSV onto the zone
-      under the embed. Unlimited tracks · private playlists · Liked Songs.
-    </div>
-    <div class="exportify-frame">
-      <iframe id="exportifyFrame" src="https://exportify.net"
-              title="Exportify" referrerpolicy="no-referrer-when-downgrade"
-              allow="clipboard-write"></iframe>
+    <ol class="steps">
+      <li>
+        <button id="openExportifyBtn" class="primary">Open Exportify ↗</button>
+        — sign in with Spotify (one time), click <b>Export</b> on any playlist.
+        Your browser saves a CSV.
+      </li>
+      <li>Drop the CSV onto the zone below.</li>
+    </ol>
+    <div class="small" style="margin-bottom: 10px;">
+      Unlimited tracks · supports private playlists and Liked Songs.
+      Exportify (open-source, browser-only) handles the Spotify OAuth — we never see your credentials.
+      <br>
+      <span class="muted">Embedding it directly doesn't work — Spotify's sign-in page blocks iframe embedding for security.</span>
     </div>
     <div id="dropZone" class="dropzone">
       <div class="dropzone-inner">
@@ -615,6 +616,12 @@ function wireDropZone() {
 // ── Wire up ─────────────────────────────────────────────
 $('importBtn').onclick = importBatch;
 $('importPasteBtn').onclick = importCsvPaste;
+$('openExportifyBtn').onclick = () => {
+  // Open in a real new window so Spotify's OAuth flow has a top-level
+  // navigation context (iframes are blocked by accounts.spotify.com's
+  // X-Frame-Options: deny + frame-ancestors policy).
+  window.open('https://exportify.net', '_blank', 'noopener,noreferrer');
+};
 wireDropZone();
 $('tabUrl').onclick = () => switchMode('url');
 $('tabCsv').onclick = () => switchMode('csv');
