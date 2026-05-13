@@ -246,7 +246,10 @@ async function importBatch() {
       throw new Error(t || `HTTP ${r.status}`);
     }
     const data = await r.json();
-    setStatus(`Imported ${data.count} tracks from "${data.label}". Hit Start to download.`, 'ok');
+    const warn = data.truncated
+      ? ' (Spotify embed caps at 50 tracks — longer playlists are truncated)'
+      : '';
+    setStatus(`Imported ${data.count} tracks from "${data.label}".${warn} Hit Start to download.`, 'ok');
     $('urlInput').value = '';
     await refresh();
   } catch (e) {

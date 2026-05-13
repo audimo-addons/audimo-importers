@@ -113,41 +113,36 @@ def _row_dict(r: sqlite3.Row) -> dict:
     return d
 
 
-# ── Spotify anonymous-token import ──────────────────────────────────
+# ── Spotify public-playlist import (embed-page scrape) ─────────────
 #
-# The public web player at open.spotify.com mints a guest bearer token
-# at /api/token (or /get_access_token, depending on rollout). We mimic
-# that flow to read PUBLIC playlists. Private/Liked Songs require real
-# OAuth, which would mean registering a client ID — out of scope here.
+# Spotify killed the anonymous web-player token endpoint in 2024 (it
+# now returns 403/400 with an explicit "not permitted under Developer
+# Terms" message). The embed page at /embed/playlist/{id} still
+# renders publicly without auth and ships the first ~50 tracks
+# inline as JSON inside a __NEXT_DATA__ script tag. That's the path
+# we use.
+#
+# Trade-offs vs. the old API approach:
+#   • Capped at the first ~50 tracks per playlist. Longer playlists
+#     are silently truncated by Spotify's embed; we surface this in
+#     the import result so the UI can warn.
+#   • No album name and no ISRC — embed only carries title+artist+
+#     duration. Source resolution by title+artist works fine for
+#     the streamers/indexers; it's the cross-platform matchers that
+#     suffer (none plumbed yet, so fine for v0.1).
+#   • Public playlists only. Private/Liked require real OAuth.
 
-_SPOTIFY_TOKEN_URL = "https://open.spotify.com/get_access_token"
-_SPOTIFY_TOKEN_URL_FALLBACK = "https://open.spotify.com/api/token"
-_SPOTIFY_API_BASE = "https://api.spotify.com/v1"
 _SPOTIFY_PLAYLIST_ID_RE = re.compile(
     r"(?:^|/)playlist/([A-Za-z0-9]+)|spotify:playlist:([A-Za-z0-9]+)"
 )
-
-
-async def _spotify_anon_token(client: httpx.AsyncClient) -> str:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0 Safari/537.36"
-        ),
-        "Accept": "application/json",
-    }
-    for url in (_SPOTIFY_TOKEN_URL, _SPOTIFY_TOKEN_URL_FALLBACK):
-        try:
-            r = await client.get(url, headers=headers, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                token = data.get("accessToken") or data.get("access_token")
-                if token:
-                    return token
-        except Exception:
-            pass
-    raise HTTPException(502, "Could not obtain Spotify anonymous token")
+_NEXT_DATA_RE = re.compile(
+    r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL,
+)
+_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0 Safari/537.36"
+)
 
 
 def _extract_spotify_playlist_id(url_or_id: str) -> str | None:
@@ -162,57 +157,106 @@ def _extract_spotify_playlist_id(url_or_id: str) -> str | None:
     return None
 
 
-async def _fetch_spotify_playlist(playlist_url: str) -> tuple[str, list[dict]]:
+def _walk_for_track_list(obj):
+    """Find the first list keyed under 'trackList' anywhere in the tree.
+
+    Defensive against Spotify reshuffling __NEXT_DATA__ paths over time.
+    The canonical path today is
+    props.pageProps.state.data.trackList — but we walk to survive
+    future renames.
+    """
+    if isinstance(obj, dict):
+        if isinstance(obj.get("trackList"), list):
+            return obj["trackList"]
+        for v in obj.values():
+            r = _walk_for_track_list(v)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _walk_for_track_list(v)
+            if r is not None:
+                return r
+    return None
+
+
+def _walk_for_entity_name(obj):
+    """Pull the playlist's display name from the entity record. Same
+    defensive walk; canonical path today is
+    props.pageProps.state.data.entity.name."""
+    if isinstance(obj, dict):
+        entity = obj.get("entity")
+        if isinstance(entity, dict) and isinstance(entity.get("name"), str):
+            return entity["name"]
+        for v in obj.values():
+            r = _walk_for_entity_name(v)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _walk_for_entity_name(v)
+            if r:
+                return r
+    return None
+
+
+async def _fetch_spotify_playlist(playlist_url: str) -> tuple[str, list[dict], bool]:
+    """Return (playlist_label, tracks, truncated).
+
+    `truncated` is True when Spotify's embed capped the list at its
+    page size (currently 50). The caller can warn the user that
+    only the first N tracks were imported.
+    """
     pid = _extract_spotify_playlist_id(playlist_url)
     if not pid:
         raise HTTPException(400, "Could not parse Spotify playlist URL")
-    async with httpx.AsyncClient() as client:
-        token = await _spotify_anon_token(client)
-        headers = {"Authorization": f"Bearer {token}"}
 
-        meta = await client.get(
-            f"{_SPOTIFY_API_BASE}/playlists/{pid}",
-            params={"fields": "name,owner(display_name)"},
-            headers=headers,
-            timeout=15,
-        )
-        if meta.status_code == 404:
-            raise HTTPException(404, "Playlist not found or private")
-        if meta.status_code != 200:
-            raise HTTPException(502, f"Spotify error: {meta.status_code}")
-        label = meta.json().get("name") or "Spotify playlist"
+    embed_url = f"https://open.spotify.com/embed/playlist/{pid}"
+    headers = {
+        "User-Agent": _BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        r = await client.get(embed_url, headers=headers, timeout=15)
+    if r.status_code == 404:
+        raise HTTPException(404, "Playlist not found")
+    if r.status_code != 200:
+        raise HTTPException(502, f"Spotify embed returned {r.status_code}")
 
-        tracks: list[dict] = []
-        next_url: str | None = (
-            f"{_SPOTIFY_API_BASE}/playlists/{pid}/tracks"
-            "?limit=100&fields=next,items(track(name,artists(name),album(name),"
-            "duration_ms,external_ids(isrc)))"
-        )
-        # Cap iterations to avoid runaway on broken pagination.
-        for _ in range(50):
-            if not next_url:
-                break
-            r = await client.get(next_url, headers=headers, timeout=20)
-            if r.status_code != 200:
-                break
-            data = r.json()
-            for item in data.get("items", []) or []:
-                t = (item or {}).get("track") or {}
-                if not t:
-                    continue
-                name = (t.get("name") or "").strip()
-                if not name:
-                    continue
-                artists = ", ".join(a.get("name", "") for a in (t.get("artists") or []) if a)
-                tracks.append({
-                    "title": name,
-                    "artist": artists,
-                    "album": ((t.get("album") or {}).get("name") or "").strip(),
-                    "isrc": ((t.get("external_ids") or {}).get("isrc") or "").strip(),
-                    "duration_ms": int(t.get("duration_ms") or 0),
-                })
-            next_url = data.get("next")
-        return label, tracks
+    m = _NEXT_DATA_RE.search(r.text)
+    if not m:
+        raise HTTPException(502, "Spotify embed did not contain track data")
+    try:
+        data = json.loads(m.group(1))
+    except Exception:
+        raise HTTPException(502, "Could not parse Spotify embed payload")
+
+    track_list = _walk_for_track_list(data) or []
+    label = _walk_for_entity_name(data) or "Spotify playlist"
+
+    tracks: list[dict] = []
+    for t in track_list:
+        if not isinstance(t, dict):
+            continue
+        name = (t.get("title") or "").strip()
+        if not name:
+            continue
+        # `subtitle` is artist(s). For multi-artist tracks the embed
+        # joins them with ", " already; pass through verbatim.
+        artist = (t.get("subtitle") or "").strip()
+        tracks.append({
+            "title": name,
+            "artist": artist,
+            "album": "",  # not in embed payload
+            "isrc": "",   # not in embed payload
+            "duration_ms": int(t.get("duration") or 0),
+        })
+
+    # The embed page caps at 50 tracks today. If we got exactly the
+    # cap, the source playlist might be longer — flag for the caller.
+    truncated = len(tracks) >= 50
+    return label, tracks, truncated
 
 
 # ── Routes: manifest, UI, queue, import ────────────────────────────
@@ -239,7 +283,7 @@ async def import_url(body: ImportURLBody):
     s = (body.url or "").lower()
     if "spotify" not in s and not _extract_spotify_playlist_id(body.url):
         raise HTTPException(400, "Only Spotify playlists are supported in v0.1")
-    label, tracks = await _fetch_spotify_playlist(body.url)
+    label, tracks, truncated = await _fetch_spotify_playlist(body.url)
     if not tracks:
         raise HTTPException(404, "Playlist is empty or unreadable")
 
@@ -263,7 +307,12 @@ async def import_url(body: ImportURLBody):
                 for t in tracks
             ],
         )
-    return {"batch_id": batch_id, "label": label, "count": len(tracks)}
+    return {
+        "batch_id": batch_id,
+        "label": label,
+        "count": len(tracks),
+        "truncated": truncated,
+    }
 
 
 @app.get("/api/queue")
