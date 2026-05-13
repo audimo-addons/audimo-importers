@@ -125,7 +125,11 @@
   <div id="modeCsv" class="mode" style="display: none;">
     <ol class="steps">
       <li>
-        <button id="openExportifyBtn" class="primary">Open Exportify ↗</button>
+        <a id="openExportifyBtn" href="https://exportify.net" target="_blank"
+           rel="noopener noreferrer"
+           style="display:inline-block; background:var(--accent); color:#0b0b0d;
+                  padding:7px 12px; border-radius:6px; font-weight:600;
+                  text-decoration:none;">Open Exportify ↗</a>
         — sign in with Spotify (one time), click <b>Export</b> on any playlist.
         Your browser saves a CSV.
       </li>
@@ -616,12 +620,20 @@ function wireDropZone() {
 // ── Wire up ─────────────────────────────────────────────
 $('importBtn').onclick = importBatch;
 $('importPasteBtn').onclick = importCsvPaste;
-$('openExportifyBtn').onclick = () => {
-  // Open in a real new window so Spotify's OAuth flow has a top-level
-  // navigation context (iframes are blocked by accounts.spotify.com's
-  // X-Frame-Options: deny + frame-ancestors policy).
-  window.open('https://exportify.net', '_blank', 'noopener,noreferrer');
-};
+$('openExportifyBtn').addEventListener('click', (e) => {
+  // The anchor's target=_blank handles the common case. Belt-and-
+  // suspenders: also ask the host app to open the URL externally, in
+  // case the iframe sandbox or the Tauri WebView blocked window.open.
+  // Sending to '*' is safe — the host (AddonTabView) validates source +
+  // origin before acting on it.
+  try {
+    window.parent.postMessage({
+      __audimo: 1, method: 'openExternal', url: 'https://exportify.net',
+    }, '*');
+  } catch {}
+  // Don't prevent the anchor's default; if both paths fire, the host
+  // dedupes (no-op the second one).
+});
 wireDropZone();
 $('tabUrl').onclick = () => switchMode('url');
 $('tabCsv').onclick = () => switchMode('csv');
