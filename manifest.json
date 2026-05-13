@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "id": "audimo-importers",
+  "name": "Importers",
+  "version": "0.1.0",
+  "min_audimo_version": "0.4.0",
+  "description": "Import music from other platforms (Spotify public playlists, more coming). Queues tracks and downloads them via your other installed source addons, N at a time.",
+  "capabilities": ["ui.tab"],
+  "ui": {
+    "tab": {
+      "label": "Import",
+      "icon": "download",
+      "sort_priority": 50,
+      "page_url": "/ui/page"
+    }
+  },
+  "source_contexts": ["music"],
+  "settings_schema": [
+    {
+      "type": "section",
+      "label": "Worker",
+      "description": "How many tracks to download concurrently. Higher = faster import, but heavier on your sources.",
+      "fields": [
+        {
+          "key": "concurrency",
+          "type": "number",
+          "label": "Concurrent downloads",
+          "default": 3
+        }
+      ]
+    }
+  ],
+  "default_settings": {
+    "concurrency": 3
+  },
+  "display": {
+    "label": "Importers",
+    "icon": "download"
+  }
+}

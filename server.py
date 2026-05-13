@@ -1,0 +1,379 @@
+"""audimo-importers — music platform import addon.
+
+Pulls track lists from public sources (Spotify public playlists via
+anonymous web-player token; CSV exports from Exportify et al. coming
+later), queues them in SQLite, and serves a tab UI that drives core's
+window.audimo.acquireTrack() to download N at a time.
+
+Architecture:
+  - sidecar (this file): owns the queue + import logic
+  - iframe page (/ui/page): renders the queue, runs the worker loop
+    that calls window.audimo.acquireTrack via the postMessage RPC
+    bridge and PATCHes status back to /api/queue/{id}.
+
+No source-resolution logic lives here — that's core's job (via
+acquireTrack). The addon never inspects the chosen source.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import sqlite3
+import time
+import urllib.parse
+from pathlib import Path
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
+
+PORT = int(os.environ.get("AUDIMO_ADDON_PORT", 9010))
+DATA_DIR = Path(os.environ.get("AUDIMO_ADDON_DATA", Path.home() / ".audimo-importers"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "queue.db"
+MANIFEST_PATH = Path(__file__).resolve().parent / "manifest.json"
+UI_PATH = Path(__file__).resolve().parent / "ui" / "page.html"
+
+app = FastAPI(title="audimo-importers")
+
+# Permissive CORS for now — the iframe is same-origin, but the
+# manifest fetch from the core app comes from a different origin
+# (the desktop WebView or 127.0.0.1:8000). Mirror what other addons
+# in this org do; tighten later if we add credentials.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+
+# ── DB ──────────────────────────────────────────────────────────────
+
+def _db() -> sqlite3.Connection:
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    return con
+
+
+def _init_db() -> None:
+    with _db() as con:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS queue (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              batch_id TEXT NOT NULL,
+              title TEXT NOT NULL,
+              artist TEXT NOT NULL DEFAULT '',
+              album TEXT NOT NULL DEFAULT '',
+              isrc TEXT NOT NULL DEFAULT '',
+              duration_ms INTEGER NOT NULL DEFAULT 0,
+              status TEXT NOT NULL DEFAULT 'pending',
+              error TEXT NOT NULL DEFAULT '',
+              policy_json TEXT NOT NULL DEFAULT '{}',
+              source TEXT NOT NULL DEFAULT '',
+              addon_id TEXT NOT NULL DEFAULT '',
+              pct INTEGER NOT NULL DEFAULT 0,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS batches (
+              id TEXT PRIMARY KEY,
+              source_label TEXT NOT NULL,
+              policy_json TEXT NOT NULL DEFAULT '{}',
+              total INTEGER NOT NULL DEFAULT 0,
+              created_at INTEGER NOT NULL
+            )
+            """
+        )
+
+
+_init_db()
+
+
+def _now() -> int:
+    return int(time.time())
+
+
+def _row_dict(r: sqlite3.Row) -> dict:
+    d = dict(r)
+    try:
+        d["policy"] = json.loads(d.pop("policy_json") or "{}")
+    except Exception:
+        d["policy"] = {}
+    return d
+
+
+# ── Spotify anonymous-token import ──────────────────────────────────
+#
+# The public web player at open.spotify.com mints a guest bearer token
+# at /api/token (or /get_access_token, depending on rollout). We mimic
+# that flow to read PUBLIC playlists. Private/Liked Songs require real
+# OAuth, which would mean registering a client ID — out of scope here.
+
+_SPOTIFY_TOKEN_URL = "https://open.spotify.com/get_access_token"
+_SPOTIFY_TOKEN_URL_FALLBACK = "https://open.spotify.com/api/token"
+_SPOTIFY_API_BASE = "https://api.spotify.com/v1"
+_SPOTIFY_PLAYLIST_ID_RE = re.compile(
+    r"(?:^|/)playlist/([A-Za-z0-9]+)|spotify:playlist:([A-Za-z0-9]+)"
+)
+
+
+async def _spotify_anon_token(client: httpx.AsyncClient) -> str:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        ),
+        "Accept": "application/json",
+    }
+    for url in (_SPOTIFY_TOKEN_URL, _SPOTIFY_TOKEN_URL_FALLBACK):
+        try:
+            r = await client.get(url, headers=headers, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                token = data.get("accessToken") or data.get("access_token")
+                if token:
+                    return token
+        except Exception:
+            pass
+    raise HTTPException(502, "Could not obtain Spotify anonymous token")
+
+
+def _extract_spotify_playlist_id(url_or_id: str) -> str | None:
+    s = (url_or_id or "").strip()
+    if not s:
+        return None
+    if re.fullmatch(r"[A-Za-z0-9]{20,}", s):
+        return s
+    m = _SPOTIFY_PLAYLIST_ID_RE.search(s)
+    if m:
+        return m.group(1) or m.group(2)
+    return None
+
+
+async def _fetch_spotify_playlist(playlist_url: str) -> tuple[str, list[dict]]:
+    pid = _extract_spotify_playlist_id(playlist_url)
+    if not pid:
+        raise HTTPException(400, "Could not parse Spotify playlist URL")
+    async with httpx.AsyncClient() as client:
+        token = await _spotify_anon_token(client)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        meta = await client.get(
+            f"{_SPOTIFY_API_BASE}/playlists/{pid}",
+            params={"fields": "name,owner(display_name)"},
+            headers=headers,
+            timeout=15,
+        )
+        if meta.status_code == 404:
+            raise HTTPException(404, "Playlist not found or private")
+        if meta.status_code != 200:
+            raise HTTPException(502, f"Spotify error: {meta.status_code}")
+        label = meta.json().get("name") or "Spotify playlist"
+
+        tracks: list[dict] = []
+        next_url: str | None = (
+            f"{_SPOTIFY_API_BASE}/playlists/{pid}/tracks"
+            "?limit=100&fields=next,items(track(name,artists(name),album(name),"
+            "duration_ms,external_ids(isrc)))"
+        )
+        # Cap iterations to avoid runaway on broken pagination.
+        for _ in range(50):
+            if not next_url:
+                break
+            r = await client.get(next_url, headers=headers, timeout=20)
+            if r.status_code != 200:
+                break
+            data = r.json()
+            for item in data.get("items", []) or []:
+                t = (item or {}).get("track") or {}
+                if not t:
+                    continue
+                name = (t.get("name") or "").strip()
+                if not name:
+                    continue
+                artists = ", ".join(a.get("name", "") for a in (t.get("artists") or []) if a)
+                tracks.append({
+                    "title": name,
+                    "artist": artists,
+                    "album": ((t.get("album") or {}).get("name") or "").strip(),
+                    "isrc": ((t.get("external_ids") or {}).get("isrc") or "").strip(),
+                    "duration_ms": int(t.get("duration_ms") or 0),
+                })
+            next_url = data.get("next")
+        return label, tracks
+
+
+# ── Routes: manifest, UI, queue, import ────────────────────────────
+
+@app.get("/manifest.json")
+async def manifest():
+    return JSONResponse(json.loads(MANIFEST_PATH.read_text()))
+
+
+@app.get("/ui/page", response_class=HTMLResponse)
+async def ui_page():
+    if UI_PATH.exists():
+        return HTMLResponse(UI_PATH.read_text())
+    return HTMLResponse("<!doctype html><h1>UI missing</h1>", status_code=500)
+
+
+class ImportURLBody(BaseModel):
+    url: str
+    policy: dict = Field(default_factory=dict)
+
+
+@app.post("/import/url")
+async def import_url(body: ImportURLBody):
+    s = (body.url or "").lower()
+    if "spotify" not in s and not _extract_spotify_playlist_id(body.url):
+        raise HTTPException(400, "Only Spotify playlists are supported in v0.1")
+    label, tracks = await _fetch_spotify_playlist(body.url)
+    if not tracks:
+        raise HTTPException(404, "Playlist is empty or unreadable")
+
+    batch_id = f"b_{_now()}_{_extract_spotify_playlist_id(body.url)}"
+    now = _now()
+    policy_json = json.dumps(body.policy or {})
+    with _db() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO batches (id, source_label, policy_json, total, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (batch_id, label, policy_json, len(tracks), now),
+        )
+        con.executemany(
+            "INSERT INTO queue (batch_id, title, artist, album, isrc, duration_ms, "
+            "policy_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    batch_id, t["title"], t["artist"], t["album"], t["isrc"],
+                    t["duration_ms"], policy_json, now, now,
+                )
+                for t in tracks
+            ],
+        )
+    return {"batch_id": batch_id, "label": label, "count": len(tracks)}
+
+
+@app.get("/api/queue")
+async def get_queue(status: str | None = None, limit: int = 500):
+    q = "SELECT * FROM queue"
+    args: tuple = ()
+    if status:
+        q += " WHERE status = ?"
+        args = (status,)
+    q += " ORDER BY id ASC LIMIT ?"
+    args = args + (max(1, min(2000, int(limit))),)
+    with _db() as con:
+        rows = con.execute(q, args).fetchall()
+        counts_rows = con.execute(
+            "SELECT status, COUNT(*) AS c FROM queue GROUP BY status"
+        ).fetchall()
+    counts = {r["status"]: r["c"] for r in counts_rows}
+    return {
+        "items": [_row_dict(r) for r in rows],
+        "counts": {
+            "pending": counts.get("pending", 0),
+            "downloading": counts.get("downloading", 0),
+            "done": counts.get("done", 0),
+            "failed": counts.get("failed", 0),
+            "total": sum(counts.values()),
+        },
+    }
+
+
+@app.get("/api/queue/next")
+async def claim_next():
+    """Atomically claim the next pending row and mark it downloading.
+
+    The iframe worker calls this in a loop with concurrency=N. SQLite
+    serializes the UPDATE so two parallel workers don't double-claim.
+    """
+    now = _now()
+    with _db() as con:
+        cur = con.execute(
+            "SELECT id FROM queue WHERE status = 'pending' "
+            "ORDER BY id ASC LIMIT 1"
+        )
+        row = cur.fetchone()
+        if not row:
+            return {"item": None}
+        cur = con.execute(
+            "UPDATE queue SET status='downloading', updated_at=? "
+            "WHERE id=? AND status='pending'",
+            (now, row["id"]),
+        )
+        if cur.rowcount == 0:
+            # Lost the race — try again.
+            return {"item": None}
+        item = con.execute("SELECT * FROM queue WHERE id=?", (row["id"],)).fetchone()
+    return {"item": _row_dict(item)}
+
+
+class PatchBody(BaseModel):
+    status: str | None = None
+    error: str | None = None
+    source: str | None = None
+    addon_id: str | None = None
+    pct: int | None = None
+
+
+@app.patch("/api/queue/{row_id}")
+async def patch_row(row_id: int, body: PatchBody):
+    sets, args = [], []
+    for f in ("status", "error", "source", "addon_id"):
+        v = getattr(body, f)
+        if v is not None:
+            sets.append(f"{f} = ?")
+            args.append(v)
+    if body.pct is not None:
+        sets.append("pct = ?")
+        args.append(max(0, min(100, int(body.pct))))
+    if not sets:
+        return {"ok": True}
+    sets.append("updated_at = ?")
+    args.append(_now())
+    args.append(row_id)
+    with _db() as con:
+        con.execute(f"UPDATE queue SET {', '.join(sets)} WHERE id = ?", tuple(args))
+    return {"ok": True}
+
+
+@app.post("/api/queue/{row_id}/retry")
+async def retry_row(row_id: int):
+    with _db() as con:
+        con.execute(
+            "UPDATE queue SET status='pending', error='', pct=0, updated_at=? WHERE id=?",
+            (_now(), row_id),
+        )
+    return {"ok": True}
+
+
+@app.delete("/api/queue/{row_id}")
+async def delete_row(row_id: int):
+    with _db() as con:
+        con.execute("DELETE FROM queue WHERE id = ?", (row_id,))
+    return {"ok": True}
+
+
+@app.post("/api/queue/clear_done")
+async def clear_done():
+    with _db() as con:
+        con.execute("DELETE FROM queue WHERE status = 'done'")
+    return {"ok": True}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="info")

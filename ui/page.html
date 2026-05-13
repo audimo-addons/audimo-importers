@@ -1,0 +1,441 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Importers</title>
+<style>
+  :root {
+    --bg: #0b0b0d;
+    --panel: #15161a;
+    --panel2: #1c1d22;
+    --fg: #e6e6e9;
+    --muted: #8a8b92;
+    --accent: #7c9eff;
+    --ok: #4ec07a;
+    --warn: #e7b34a;
+    --err: #e8696a;
+    --border: #25262d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px 24px 64px;
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg); color: var(--fg);
+  }
+  h1 { font-size: 22px; margin: 0 0 16px; font-weight: 600; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em;
+       color: var(--muted); margin: 24px 0 8px; font-weight: 600; }
+  .card { background: var(--panel); border: 1px solid var(--border);
+          border-radius: 10px; padding: 14px 16px; margin-bottom: 12px; }
+  .row { display: flex; gap: 10px; align-items: center; }
+  .row.wrap { flex-wrap: wrap; }
+  input[type=text], input[type=url], select {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 10px; font: inherit; min-width: 0;
+  }
+  input[type=text]:focus, input[type=url]:focus, select:focus {
+    outline: none; border-color: var(--accent);
+  }
+  button {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 12px; font: inherit; cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #0b0b0d; font-weight: 600; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button:hover:not(:disabled) { filter: brightness(1.15); }
+  .counts { display: flex; gap: 16px; font-size: 12px; color: var(--muted); margin: 8px 0 14px; }
+  .counts b { color: var(--fg); }
+  .qrow {
+    display: grid; grid-template-columns: 1fr 80px auto; gap: 12px;
+    padding: 8px 12px; border-bottom: 1px solid var(--border);
+    align-items: center;
+  }
+  .qrow:last-child { border-bottom: 0; }
+  .qrow .title { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .qrow .sub { color: var(--muted); font-size: 12px; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+  }
+  .badge.pending { background: #2a2b32; color: var(--muted); }
+  .badge.downloading { background: #1f2d3a; color: var(--accent); }
+  .badge.done { background: #15301f; color: var(--ok); }
+  .badge.failed { background: #321b1c; color: var(--err); }
+  .progress { height: 4px; background: var(--panel2); border-radius: 2px; overflow: hidden; margin-top: 4px; }
+  .progress > div { height: 100%; background: var(--accent); transition: width 0.3s; }
+  .error { color: var(--err); font-size: 12px; margin-top: 2px; }
+  .empty { color: var(--muted); padding: 18px; text-align: center; font-style: italic; }
+  .small { font-size: 11px; color: var(--muted); }
+  .row > input { flex: 1; }
+  .policy {
+    display: grid; grid-template-columns: max-content 1fr; gap: 6px 10px;
+    align-items: center; margin-top: 10px;
+  }
+</style>
+</head>
+<body>
+
+<h1>Import</h1>
+
+<!-- ── Add batch ──────────────────────────────────────────── -->
+<div class="card">
+  <div class="row wrap">
+    <input id="urlInput" type="url" placeholder="Spotify playlist URL — e.g. https://open.spotify.com/playlist/37i9..." />
+    <button id="importBtn" class="primary">Import</button>
+  </div>
+  <div class="policy">
+    <label class="small" for="prefer">Prefer addon</label>
+    <select id="prefer">
+      <option value="">(auto — first available)</option>
+    </select>
+    <label class="small" for="concurrency">Concurrency</label>
+    <select id="concurrency">
+      <option>1</option><option>2</option><option selected>3</option><option>5</option><option>8</option>
+    </select>
+  </div>
+  <div class="small" id="status" style="margin-top: 8px;"></div>
+</div>
+
+<!-- ── Worker control ─────────────────────────────────────── -->
+<div class="card row" style="justify-content: space-between;">
+  <div class="counts">
+    <span>Pending <b id="cPending">0</b></span>
+    <span>Downloading <b id="cDownloading">0</b></span>
+    <span>Done <b id="cDone">0</b></span>
+    <span>Failed <b id="cFailed">0</b></span>
+  </div>
+  <div class="row">
+    <button id="startBtn" class="primary">Start</button>
+    <button id="pauseBtn" disabled>Pause</button>
+    <button id="clearBtn">Clear done</button>
+  </div>
+</div>
+
+<!-- ── Queue list ─────────────────────────────────────────── -->
+<h2>Queue</h2>
+<div class="card" id="queueCard">
+  <div class="empty">Nothing imported yet. Paste a Spotify playlist URL above.</div>
+</div>
+
+<!-- ── window.audimo shim (inlined — addon is loaded in iframe sandboxed
+     from the parent's origin, so it can't fetch /audimo-addon-rpc.js
+     from there). Keep in sync with frontend/public/audimo-addon-rpc.js
+     in the core repo. ───────────────────────────────────────── -->
+<script>
+(function () {
+  if (window.audimo) return;
+  const pending = new Map();
+  const streams = new Map();
+  const uuid = () => (window.crypto && window.crypto.randomUUID)
+    ? window.crypto.randomUUID() : 'r_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10);
+  const send = (method, args) => {
+    const rpc_id = uuid();
+    window.parent.postMessage({ __audimo: 1, rpc_id, method, args }, '*');
+    return rpc_id;
+  };
+  const call = (method, args) => new Promise((resolve, reject) => {
+    pending.set(send(method, args), { resolve, reject });
+  });
+  const callStream = (method, args) => {
+    const rpc_id = send(method, args);
+    const queue = [];
+    let waiters = [];
+    let ended = false;
+    let err = null;
+    streams.set(rpc_id, {
+      push: (ev) => waiters.length ? waiters.shift()({ value: ev, done: false }) : queue.push(ev),
+      end:  () => { ended = true; waiters.forEach(w => w({ value: undefined, done: true })); waiters = []; streams.delete(rpc_id); },
+      err:  (e) => { err = e; waiters.forEach(w => w(Promise.reject(e))); waiters = []; streams.delete(rpc_id); },
+    });
+    return {
+      rpc_id,
+      [Symbol.asyncIterator]() {
+        return {
+          next: () => {
+            if (err) return Promise.reject(err);
+            if (queue.length) return Promise.resolve({ value: queue.shift(), done: false });
+            if (ended) return Promise.resolve({ value: undefined, done: true });
+            return new Promise(resolve => waiters.push(resolve));
+          },
+          return: () => {
+            window.parent.postMessage({ __audimo: 1, rpc_id, cancel: true }, '*');
+            ended = true;
+            return Promise.resolve({ value: undefined, done: true });
+          },
+        };
+      },
+    };
+  };
+  window.addEventListener('message', (e) => {
+    const m = e.data;
+    if (!m || m.__audimo !== 1 || !m.rpc_id) return;
+    if ('result' in m || 'error' in m) {
+      const p = pending.get(m.rpc_id);
+      if (!p) return;
+      pending.delete(m.rpc_id);
+      'error' in m ? p.reject(new Error(m.error || 'rpc error')) : p.resolve(m.result);
+      return;
+    }
+    if ('event' in m) {
+      const s = streams.get(m.rpc_id);
+      if (s) s.push(m.event);
+      return;
+    }
+    if (m.done) {
+      const s = streams.get(m.rpc_id);
+      if (s) s.end();
+    }
+  });
+  window.audimo = {
+    listAddons: () => call('listAddons'),
+    acquireTrack: (args) => callStream('acquireTrack', args),
+    cancel: (rpc_id) => window.parent.postMessage({ __audimo: 1, rpc_id, cancel: true }, '*'),
+  };
+  try { window.parent.postMessage({ __audimo: 1, ready: true }, '*'); } catch {}
+})();
+</script>
+
+<!-- ── App logic ───────────────────────────────────────────── -->
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const statusEl = $('status');
+let workerRunning = false;
+let pollHandle = null;
+let activeJobs = new Set();
+
+function setStatus(msg, kind = '') {
+  statusEl.textContent = msg || '';
+  statusEl.style.color = kind === 'err' ? 'var(--err)' : kind === 'ok' ? 'var(--ok)' : 'var(--muted)';
+}
+
+async function populateAddons() {
+  try {
+    const addons = await window.audimo.listAddons();
+    const sel = $('prefer');
+    for (const a of addons) {
+      if (!a.enabled) continue;
+      if (!(a.capabilities || []).includes('resolve.sources')) continue;
+      const opt = document.createElement('option');
+      opt.value = a.id;
+      opt.textContent = a.label || a.id;
+      sel.appendChild(opt);
+    }
+  } catch (e) {
+    console.warn('listAddons failed', e);
+  }
+}
+
+async function importBatch() {
+  const url = $('urlInput').value.trim();
+  if (!url) { setStatus('Paste a Spotify playlist URL first.', 'err'); return; }
+  const policy = {};
+  const pref = $('prefer').value;
+  if (pref) policy.prefer = [pref];
+
+  setStatus('Fetching playlist…');
+  $('importBtn').disabled = true;
+  try {
+    const r = await fetch('/import/url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, policy }),
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(t || `HTTP ${r.status}`);
+    }
+    const data = await r.json();
+    setStatus(`Imported ${data.count} tracks from "${data.label}". Hit Start to download.`, 'ok');
+    $('urlInput').value = '';
+    await refresh();
+  } catch (e) {
+    setStatus(`Import failed: ${e.message}`, 'err');
+  } finally {
+    $('importBtn').disabled = false;
+  }
+}
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/queue');
+    const data = await r.json();
+    renderQueue(data.items);
+    renderCounts(data.counts);
+  } catch (e) {
+    console.warn('refresh', e);
+  }
+}
+
+function renderCounts(c) {
+  $('cPending').textContent = c.pending || 0;
+  $('cDownloading').textContent = c.downloading || 0;
+  $('cDone').textContent = c.done || 0;
+  $('cFailed').textContent = c.failed || 0;
+}
+
+function renderQueue(items) {
+  const card = $('queueCard');
+  if (!items.length) {
+    card.innerHTML = '<div class="empty">Nothing imported yet. Paste a Spotify playlist URL above.</div>';
+    return;
+  }
+  card.innerHTML = '';
+  for (const it of items) {
+    const row = document.createElement('div');
+    row.className = 'qrow';
+
+    const left = document.createElement('div');
+    left.innerHTML = `<div class="title">${escape(it.title)}</div>
+      <div class="sub">${escape(it.artist || '')}${it.album ? ' · ' + escape(it.album) : ''}</div>`;
+    if (it.status === 'downloading') {
+      left.innerHTML += `<div class="progress"><div style="width:${it.pct || 0}%"></div></div>`;
+    }
+    if (it.status === 'failed' && it.error) {
+      left.innerHTML += `<div class="error">${escape(it.error)}</div>`;
+    }
+    row.appendChild(left);
+
+    const badge = document.createElement('span');
+    badge.className = `badge ${it.status}`;
+    badge.textContent = it.status;
+    row.appendChild(badge);
+
+    const actions = document.createElement('div');
+    if (it.status === 'failed') {
+      const btn = document.createElement('button');
+      btn.textContent = 'Retry';
+      btn.onclick = () => fetch(`/api/queue/${it.id}/retry`, { method: 'POST' }).then(refresh);
+      actions.appendChild(btn);
+    } else if (it.status === 'pending') {
+      const btn = document.createElement('button');
+      btn.textContent = '×';
+      btn.title = 'Remove';
+      btn.onclick = () => fetch(`/api/queue/${it.id}`, { method: 'DELETE' }).then(refresh);
+      actions.appendChild(btn);
+    }
+    row.appendChild(actions);
+    card.appendChild(row);
+  }
+}
+
+function escape(s) {
+  return String(s || '').replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  })[c]);
+}
+
+// ── Worker loop ───────────────────────────────────────────
+async function runOne() {
+  const r = await fetch('/api/queue/next');
+  const data = await r.json();
+  const item = data.item;
+  if (!item) return false;
+
+  activeJobs.add(item.id);
+  try {
+    const policy = item.policy || {};
+    const iter = window.audimo.acquireTrack({
+      title: item.title,
+      artist: item.artist,
+      album: item.album,
+      kind: 'music',
+      policy,
+    });
+    let finalErr = null;
+    let finalSrc = '';
+    let finalAddon = '';
+    for await (const ev of iter) {
+      if (ev.status === 'downloading' && typeof ev.pct === 'number') {
+        fetch(`/api/queue/${item.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pct: Math.round(ev.pct) }),
+        }).catch(() => {});
+      } else if (ev.status === 'picked') {
+        finalAddon = ev.addon_id || '';
+      } else if (ev.status === 'done') {
+        finalSrc = ev.source || '';
+        finalAddon = ev.addon_id || finalAddon;
+      } else if (ev.status === 'error') {
+        finalErr = ev.message || 'unknown error';
+      }
+    }
+    await fetch(`/api/queue/${item.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        status: finalErr ? 'failed' : 'done',
+        error: finalErr || '',
+        source: finalSrc,
+        addon_id: finalAddon,
+        pct: finalErr ? 0 : 100,
+      }),
+    });
+  } catch (e) {
+    await fetch(`/api/queue/${item.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'failed', error: e.message || 'worker error' }),
+    });
+  } finally {
+    activeJobs.delete(item.id);
+  }
+  return true;
+}
+
+let inflight = 0;
+
+async function workerTick() {
+  if (!workerRunning) return;
+  const conc = parseInt($('concurrency').value, 10) || 3;
+  while (workerRunning && inflight < conc) {
+    inflight++;
+    (async () => {
+      try {
+        const found = await runOne();
+        if (!found) {
+          // No pending rows — back off briefly before re-checking.
+          await new Promise(r => setTimeout(r, 1200));
+        }
+      } finally {
+        inflight--;
+        if (workerRunning) workerTick();
+      }
+    })();
+    await new Promise(r => setTimeout(r, 50));
+  }
+}
+
+function startWorker() {
+  if (workerRunning) return;
+  workerRunning = true;
+  $('startBtn').disabled = true;
+  $('pauseBtn').disabled = false;
+  setStatus('Worker running…');
+  workerTick();
+  pollHandle = setInterval(refresh, 1500);
+}
+
+function pauseWorker() {
+  workerRunning = false;
+  $('startBtn').disabled = false;
+  $('pauseBtn').disabled = true;
+  setStatus('Paused.');
+  if (pollHandle) { clearInterval(pollHandle); pollHandle = null; }
+  refresh();
+}
+
+// ── Wire up ─────────────────────────────────────────────
+$('importBtn').onclick = importBatch;
+$('startBtn').onclick = startWorker;
+$('pauseBtn').onclick = pauseWorker;
+$('clearBtn').onclick = () => fetch('/api/queue/clear_done', { method: 'POST' }).then(refresh);
+$('urlInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') importBatch(); });
+
+populateAddons();
+refresh();
+setInterval(() => { if (!workerRunning) refresh(); }, 5000);
+</script>
+</body>
+</html>
