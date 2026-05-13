@@ -82,6 +82,22 @@
   a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; }
   code { background: var(--panel2); padding: 1px 5px; border-radius: 3px; font-size: 11px; }
+  .exportify-frame {
+    border: 1px solid var(--border); border-radius: 8px;
+    overflow: hidden; background: #fff;
+    height: 520px;
+  }
+  .exportify-frame iframe { width: 100%; height: 100%; border: 0; display: block; }
+  .dropzone {
+    margin-top: 10px;
+    border: 2px dashed var(--border); border-radius: 8px;
+    padding: 22px; text-align: center; transition: border-color 0.15s, background 0.15s;
+    cursor: pointer;
+  }
+  .dropzone.drag { border-color: var(--accent); background: rgba(124, 158, 255, 0.06); }
+  .dropzone-title { font-weight: 600; margin-bottom: 4px; }
+  .dropzone-inner { pointer-events: none; }
+  .dropzone label, .dropzone-inner label { pointer-events: auto; }
 </style>
 </head>
 <body>
@@ -110,17 +126,27 @@
 
   <!-- CSV mode -->
   <div id="modeCsv" class="mode" style="display: none;">
-    <div class="row wrap">
-      <input id="csvFile" type="file" accept=".csv,text/csv" />
-      <button id="importCsvBtn" class="primary">Import CSV</button>
+    <div class="small" style="margin-bottom: 8px;">
+      1. Sign in to Spotify below (one time). 2. Click <b>Export</b> next to a
+      playlist — your browser saves a CSV. 3. Drop that CSV onto the zone
+      under the embed. Unlimited tracks · private playlists · Liked Songs.
     </div>
-    <div class="small" style="margin-top: 6px;">
-      Drop an Exportify CSV (or any CSV with <code>Track Name</code> +
-      <code>Artist Name(s)</code> columns). Unlimited tracks, supports
-      private playlists + Liked Songs.
+    <div class="exportify-frame">
+      <iframe id="exportifyFrame" src="https://exportify.net"
+              title="Exportify" referrerpolicy="no-referrer-when-downgrade"
+              allow="clipboard-write"></iframe>
     </div>
-    <details style="margin-top: 8px;">
-      <summary class="small" style="cursor: pointer;">Or paste CSV text</summary>
+    <div id="dropZone" class="dropzone">
+      <div class="dropzone-inner">
+        <div class="dropzone-title">⬇  Drop your exported CSV here</div>
+        <div class="small">or
+          <label for="csvFile" style="color: var(--accent); cursor: pointer; text-decoration: underline;">choose file</label>
+          <input id="csvFile" type="file" accept=".csv,text/csv" hidden />
+        </div>
+      </div>
+    </div>
+    <details style="margin-top: 10px;">
+      <summary class="small" style="cursor: pointer;">Or paste CSV text instead</summary>
       <textarea id="csvPaste" rows="6" placeholder="Track Name,Artist Name(s),Album Name,...&#10;Blue Monday,New Order,Power Corruption &amp; Lies,..."
         style="width:100%; margin-top:6px; padding: 8px; background: var(--panel2); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; font-family: var(--font-mono, monospace); font-size: 12px;"></textarea>
       <div class="row" style="margin-top: 6px;">
@@ -481,12 +507,9 @@ function policyFromUI() {
   return policy;
 }
 
-async function importCsvFile() {
-  const fileInput = $('csvFile');
-  const f = fileInput.files && fileInput.files[0];
-  if (!f) { setStatus('Pick a CSV file first.', 'err'); return; }
+async function importCsvFileFrom(f) {
+  if (!f) return;
   setStatus(`Parsing ${f.name}…`);
-  $('importCsvBtn').disabled = true;
   try {
     const fd = new FormData();
     fd.append('file', f);
@@ -498,13 +521,18 @@ async function importCsvFile() {
     }
     const data = await r.json();
     setStatus(`Imported ${data.count} tracks from "${data.label}". Hit Start to download.`, 'ok');
-    fileInput.value = '';
     await refresh();
   } catch (e) {
     setStatus(`CSV import failed: ${e.message}`, 'err');
-  } finally {
-    $('importCsvBtn').disabled = false;
   }
+}
+
+async function importCsvFile() {
+  const fileInput = $('csvFile');
+  const f = fileInput.files && fileInput.files[0];
+  if (!f) { setStatus('Pick a CSV file first.', 'err'); return; }
+  await importCsvFileFrom(f);
+  fileInput.value = '';
 }
 
 async function importCsvPaste() {
@@ -545,10 +573,49 @@ function switchMode(mode) {
   $('modeCsv').style.display = mode === 'csv' ? '' : 'none';
 }
 
+function wireDropZone() {
+  const zone = $('dropZone');
+  const fileInput = $('csvFile');
+  if (!zone || !fileInput) return;
+
+  // Clicking the zone (outside the inner label) opens the file picker too —
+  // matches a common drop-zone affordance.
+  zone.addEventListener('click', (e) => {
+    if (e.target.tagName === 'LABEL' || e.target.tagName === 'INPUT') return;
+    fileInput.click();
+  });
+
+  fileInput.addEventListener('change', () => {
+    const f = fileInput.files && fileInput.files[0];
+    if (f) {
+      importCsvFileFrom(f).finally(() => { fileInput.value = ''; });
+    }
+  });
+
+  ['dragenter', 'dragover'].forEach(ev => {
+    zone.addEventListener(ev, (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      zone.classList.add('drag');
+    });
+  });
+  ['dragleave', 'drop'].forEach(ev => {
+    zone.addEventListener(ev, (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      zone.classList.remove('drag');
+    });
+  });
+  zone.addEventListener('drop', (e) => {
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) importCsvFileFrom(f);
+  });
+}
+
 // ── Wire up ─────────────────────────────────────────────
 $('importBtn').onclick = importBatch;
-$('importCsvBtn').onclick = importCsvFile;
 $('importPasteBtn').onclick = importCsvPaste;
+wireDropZone();
 $('tabUrl').onclick = () => switchMode('url');
 $('tabCsv').onclick = () => switchMode('csv');
 $('startBtn').onclick = startWorker;
