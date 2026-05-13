@@ -17,6 +17,8 @@ acquireTrack). The addon never inspects the chosen source.
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import os
 import re
@@ -26,7 +28,7 @@ import urllib.parse
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -273,6 +275,168 @@ async def ui_page():
     return HTMLResponse("<!doctype html><h1>UI missing</h1>", status_code=500)
 
 
+# ── CSV import (Exportify et al.) ───────────────────────────────────
+#
+# Bulletproof unlimited-tracks path: user runs exportify.net (or
+# similar), exports any playlist (including private + Liked Songs) to
+# CSV, drops the file in. We auto-detect common schemas.
+#
+# Exportify column names (canonical):
+#   Track Name, Album Name, Artist Name(s), Release Date,
+#   Duration (ms), ISRC, ...
+#
+# Soundiiz, TuneMyMusic, and hand-rolled CSVs use slightly different
+# headers — we normalize via a synonym map. Unknown columns are
+# ignored; missing-but-needed columns raise.
+
+_CSV_HEADER_SYNONYMS = {
+    "title": ["track name", "title", "name", "song", "song name", "track"],
+    "artist": ["artist name(s)", "artist", "artists", "artist name", "artist names"],
+    "album": ["album name", "album"],
+    "isrc": ["isrc"],
+    "duration_ms": ["duration (ms)", "duration_ms", "duration ms"],
+    "duration_s": ["duration (s)", "duration", "length", "duration (seconds)"],
+}
+
+
+def _csv_normalize_header(h: str) -> str:
+    return (h or "").strip().lower()
+
+
+def _csv_pick_column(header: list[str], canonical: str) -> int | None:
+    wants = _CSV_HEADER_SYNONYMS.get(canonical, [])
+    norm = [_csv_normalize_header(h) for h in header]
+    for w in wants:
+        if w in norm:
+            return norm.index(w)
+    return None
+
+
+def _parse_csv_tracks(text: str) -> list[dict]:
+    # Strip UTF-8 BOM if present, then sniff dialect. Default to comma
+    # if the sniffer can't decide — Exportify and friends all use it.
+    text = (text or "").lstrip("﻿")
+    if not text.strip():
+        raise HTTPException(400, "CSV is empty")
+    try:
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t")
+    except csv.Error:
+        dialect = csv.excel
+    reader = csv.reader(io.StringIO(text), dialect)
+    rows = list(reader)
+    if not rows:
+        raise HTTPException(400, "CSV has no rows")
+    header = rows[0]
+    body = rows[1:]
+    if not body:
+        raise HTTPException(400, "CSV has a header but no data rows")
+
+    idx_title = _csv_pick_column(header, "title")
+    idx_artist = _csv_pick_column(header, "artist")
+    if idx_title is None or idx_artist is None:
+        raise HTTPException(
+            400,
+            "Could not find Track Name + Artist columns. Expected headers "
+            "like 'Track Name' and 'Artist Name(s)' (Exportify) or "
+            "'Title' and 'Artist'.",
+        )
+    idx_album = _csv_pick_column(header, "album")
+    idx_isrc = _csv_pick_column(header, "isrc")
+    idx_dur_ms = _csv_pick_column(header, "duration_ms")
+    idx_dur_s = _csv_pick_column(header, "duration_s")
+
+    def cell(row, i):
+        return (row[i].strip() if i is not None and i < len(row) else "")
+
+    tracks: list[dict] = []
+    for row in body:
+        title = cell(row, idx_title)
+        artist = cell(row, idx_artist)
+        if not title or not artist:
+            continue
+        if idx_dur_ms is not None:
+            try:
+                dur_ms = int(float(cell(row, idx_dur_ms) or 0))
+            except ValueError:
+                dur_ms = 0
+        elif idx_dur_s is not None:
+            try:
+                dur_ms = int(float(cell(row, idx_dur_s) or 0) * 1000)
+            except ValueError:
+                dur_ms = 0
+        else:
+            dur_ms = 0
+        tracks.append({
+            "title": title,
+            "artist": artist,
+            "album": cell(row, idx_album),
+            "isrc": cell(row, idx_isrc),
+            "duration_ms": dur_ms,
+        })
+    if not tracks:
+        raise HTTPException(400, "CSV had rows but none with title+artist")
+    return tracks
+
+
+def _commit_batch(label: str, tracks: list[dict], policy: dict, source_id: str) -> dict:
+    batch_id = f"b_{_now()}_{source_id}"
+    now = _now()
+    policy_json = json.dumps(policy or {})
+    with _db() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO batches (id, source_label, policy_json, total, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (batch_id, label, policy_json, len(tracks), now),
+        )
+        con.executemany(
+            "INSERT INTO queue (batch_id, title, artist, album, isrc, duration_ms, "
+            "policy_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (batch_id, t["title"], t["artist"], t["album"], t["isrc"],
+                 t["duration_ms"], policy_json, now, now)
+                for t in tracks
+            ],
+        )
+    return {"batch_id": batch_id, "label": label, "count": len(tracks)}
+
+
+class ImportCSVBody(BaseModel):
+    csv: str
+    label: str | None = None
+    policy: dict = Field(default_factory=dict)
+
+
+@app.post("/import/csv")
+async def import_csv_paste(body: ImportCSVBody):
+    tracks = _parse_csv_tracks(body.csv)
+    label = (body.label or "").strip() or "CSV import"
+    return _commit_batch(label, tracks, body.policy, "csv")
+
+
+@app.post("/import/csv_file")
+async def import_csv_file(
+    file: UploadFile = File(...),
+    label: str = Form(""),
+    policy: str = Form("{}"),
+):
+    raw = await file.read()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1")
+    tracks = _parse_csv_tracks(text)
+    try:
+        pol = json.loads(policy or "{}") or {}
+    except json.JSONDecodeError:
+        pol = {}
+    # Use the filename (sans extension) as the batch label when the
+    # user didn't supply one. Exportify saves as
+    # "playlist-name__owner.csv" — fine to keep as-is.
+    if not label:
+        label = (file.filename or "CSV import").rsplit(".", 1)[0]
+    return _commit_batch(label, tracks, pol, "csvfile")
+
+
 class ImportURLBody(BaseModel):
     url: str
     policy: dict = Field(default_factory=dict)
@@ -286,33 +450,10 @@ async def import_url(body: ImportURLBody):
     label, tracks, truncated = await _fetch_spotify_playlist(body.url)
     if not tracks:
         raise HTTPException(404, "Playlist is empty or unreadable")
-
-    batch_id = f"b_{_now()}_{_extract_spotify_playlist_id(body.url)}"
-    now = _now()
-    policy_json = json.dumps(body.policy or {})
-    with _db() as con:
-        con.execute(
-            "INSERT OR REPLACE INTO batches (id, source_label, policy_json, total, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (batch_id, label, policy_json, len(tracks), now),
-        )
-        con.executemany(
-            "INSERT INTO queue (batch_id, title, artist, album, isrc, duration_ms, "
-            "policy_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                (
-                    batch_id, t["title"], t["artist"], t["album"], t["isrc"],
-                    t["duration_ms"], policy_json, now, now,
-                )
-                for t in tracks
-            ],
-        )
-    return {
-        "batch_id": batch_id,
-        "label": label,
-        "count": len(tracks),
-        "truncated": truncated,
-    }
+    pid = _extract_spotify_playlist_id(body.url) or "spotify"
+    result = _commit_batch(label, tracks, body.policy, pid)
+    result["truncated"] = truncated
+    return result
 
 
 @app.get("/api/queue")

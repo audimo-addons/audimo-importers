@@ -72,6 +72,16 @@
     display: grid; grid-template-columns: max-content 1fr; gap: 6px 10px;
     align-items: center; margin-top: 10px;
   }
+  .tab {
+    background: transparent; border: 0; border-bottom: 2px solid transparent;
+    border-radius: 0; padding: 8px 14px; color: var(--muted);
+    font-weight: 600; cursor: pointer;
+  }
+  .tab.active { color: var(--fg); border-bottom-color: var(--accent); }
+  .tab:hover:not(.active) { color: var(--fg); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code { background: var(--panel2); padding: 1px 5px; border-radius: 3px; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -80,10 +90,45 @@
 
 <!-- ── Add batch ──────────────────────────────────────────── -->
 <div class="card">
-  <div class="row wrap">
-    <input id="urlInput" type="url" placeholder="Spotify playlist URL — e.g. https://open.spotify.com/playlist/37i9..." />
-    <button id="importBtn" class="primary">Import</button>
+  <div style="display: flex; gap: 4px; margin-bottom: 12px; border-bottom: 1px solid var(--border);">
+    <button id="tabUrl" class="tab active" data-mode="url">From URL</button>
+    <button id="tabCsv" class="tab" data-mode="csv">From CSV</button>
   </div>
+
+  <!-- URL mode -->
+  <div id="modeUrl" class="mode">
+    <div class="row wrap">
+      <input id="urlInput" type="url" placeholder="Spotify playlist URL — e.g. https://open.spotify.com/playlist/37i9..." />
+      <button id="importBtn" class="primary">Import</button>
+    </div>
+    <div class="small" style="margin-top: 6px;">
+      Public playlists only · capped at 50 tracks (Spotify's embed limit).
+      For unlimited tracks + private playlists, use <b>From CSV</b> via
+      <a href="https://exportify.net" target="_blank" rel="noopener" style="color:var(--accent);">exportify.net</a>.
+    </div>
+  </div>
+
+  <!-- CSV mode -->
+  <div id="modeCsv" class="mode" style="display: none;">
+    <div class="row wrap">
+      <input id="csvFile" type="file" accept=".csv,text/csv" />
+      <button id="importCsvBtn" class="primary">Import CSV</button>
+    </div>
+    <div class="small" style="margin-top: 6px;">
+      Drop an Exportify CSV (or any CSV with <code>Track Name</code> +
+      <code>Artist Name(s)</code> columns). Unlimited tracks, supports
+      private playlists + Liked Songs.
+    </div>
+    <details style="margin-top: 8px;">
+      <summary class="small" style="cursor: pointer;">Or paste CSV text</summary>
+      <textarea id="csvPaste" rows="6" placeholder="Track Name,Artist Name(s),Album Name,...&#10;Blue Monday,New Order,Power Corruption &amp; Lies,..."
+        style="width:100%; margin-top:6px; padding: 8px; background: var(--panel2); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; font-family: var(--font-mono, monospace); font-size: 12px;"></textarea>
+      <div class="row" style="margin-top: 6px;">
+        <button id="importPasteBtn">Import pasted CSV</button>
+      </div>
+    </details>
+  </div>
+
   <div class="policy">
     <label class="small" for="prefer">Prefer addon</label>
     <select id="prefer">
@@ -429,8 +474,83 @@ function pauseWorker() {
   refresh();
 }
 
+function policyFromUI() {
+  const policy = {};
+  const pref = $('prefer').value;
+  if (pref) policy.prefer = [pref];
+  return policy;
+}
+
+async function importCsvFile() {
+  const fileInput = $('csvFile');
+  const f = fileInput.files && fileInput.files[0];
+  if (!f) { setStatus('Pick a CSV file first.', 'err'); return; }
+  setStatus(`Parsing ${f.name}…`);
+  $('importCsvBtn').disabled = true;
+  try {
+    const fd = new FormData();
+    fd.append('file', f);
+    fd.append('policy', JSON.stringify(policyFromUI()));
+    const r = await fetch('/import/csv_file', { method: 'POST', body: fd });
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(parseDetail(t) || `HTTP ${r.status}`);
+    }
+    const data = await r.json();
+    setStatus(`Imported ${data.count} tracks from "${data.label}". Hit Start to download.`, 'ok');
+    fileInput.value = '';
+    await refresh();
+  } catch (e) {
+    setStatus(`CSV import failed: ${e.message}`, 'err');
+  } finally {
+    $('importCsvBtn').disabled = false;
+  }
+}
+
+async function importCsvPaste() {
+  const csv = $('csvPaste').value;
+  if (!csv.trim()) { setStatus('Paste CSV text first.', 'err'); return; }
+  setStatus('Parsing CSV…');
+  $('importPasteBtn').disabled = true;
+  try {
+    const r = await fetch('/import/csv', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ csv, policy: policyFromUI() }),
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(parseDetail(t) || `HTTP ${r.status}`);
+    }
+    const data = await r.json();
+    setStatus(`Imported ${data.count} tracks from "${data.label}". Hit Start to download.`, 'ok');
+    $('csvPaste').value = '';
+    await refresh();
+  } catch (e) {
+    setStatus(`CSV import failed: ${e.message}`, 'err');
+  } finally {
+    $('importPasteBtn').disabled = false;
+  }
+}
+
+function parseDetail(t) {
+  try { return JSON.parse(t).detail; } catch { return t; }
+}
+
+function switchMode(mode) {
+  document.querySelectorAll('.tab').forEach(b => {
+    b.classList.toggle('active', b.dataset.mode === mode);
+  });
+  $('modeUrl').style.display = mode === 'url' ? '' : 'none';
+  $('modeCsv').style.display = mode === 'csv' ? '' : 'none';
+}
+
 // ── Wire up ─────────────────────────────────────────────
 $('importBtn').onclick = importBatch;
+$('importCsvBtn').onclick = importCsvFile;
+$('importPasteBtn').onclick = importCsvPaste;
+$('tabUrl').onclick = () => switchMode('url');
+$('tabCsv').onclick = () => switchMode('csv');
 $('startBtn').onclick = startWorker;
 $('pauseBtn').onclick = pauseWorker;
 $('clearBtn').onclick = () => fetch('/api/queue/clear_done', { method: 'POST' }).then(refresh);
